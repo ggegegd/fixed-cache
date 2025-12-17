@@ -124,21 +124,26 @@ where
     /// Insert
     pub fn insert(&self, key: K, value: V) {
         let (bucket, tag) = self.calc(&key);
-        self.insert_inner(key, value, bucket, tag);
+        self.insert_inner(|| key, || value, bucket, tag);
     }
 
     #[inline]
-    fn insert_inner(&self, key: K, value: V, bucket: &Bucket<(K, V)>, tag: usize) -> V {
+    fn insert_inner(
+        &self,
+        make_key: impl FnOnce() -> K,
+        make_value: impl FnOnce() -> V,
+        bucket: &Bucket<(K, V)>,
+        tag: usize,
+    ) {
         if bucket.try_lock(None) {
             // SAFETY: We hold the lock, so we have exclusive access.
             unsafe {
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
-                (&raw mut (*data).0).write(key);
-                (&raw mut (*data).1).write(value.clone());
+                (&raw mut (*data).0).write(make_key());
+                (&raw mut (*data).1).write(make_value());
             }
             bucket.unlock(tag);
         }
-        value
     }
 
     /// Gets a value from the cache, or inserts one computed by `f` if not present.
@@ -149,14 +154,42 @@ where
     pub fn get_or_insert_with<F>(&self, key: K, f: F) -> V
     where
         F: FnOnce(&K) -> V,
-        K: Clone,
     {
-        let (bucket, tag) = self.calc(&key);
-        if let Some(v) = self.get_inner(&key, bucket, tag) {
+        let mut key = std::mem::ManuallyDrop::new(key);
+        let mut read = false;
+        let r = self.get_or_insert_with_ref(&*key, f, |k| {
+            read = true;
+            unsafe { std::ptr::read(k) }
+        });
+        if !read {
+            unsafe { std::mem::ManuallyDrop::drop(&mut key) }
+        }
+        r
+    }
+
+    /// Gets a value from the cache, or inserts one computed by `f` if not present.
+    ///
+    /// If the key is found in the cache, returns a clone of the cached value.
+    /// Otherwise, calls `f` to compute the value, attempts to insert it, and returns it.
+    ///
+    /// This is the same as [`get_or_insert_with`], but takes a reference to the key, and a function
+    /// to get the key reference to an owned key.
+    ///
+    /// [`get_or_insert_with`]: Self::get_or_insert_with
+    #[inline]
+    pub fn get_or_insert_with_ref<Q, F, Cvt>(&self, key: &Q, f: F, cvt: Cvt) -> V
+    where
+        Q: ?Sized + Hash + Equivalent<K>,
+        F: FnOnce(&Q) -> V,
+        Cvt: FnOnce(&Q) -> K,
+    {
+        let (bucket, tag) = self.calc(key);
+        if let Some(v) = self.get_inner(key, bucket, tag) {
             return v;
         }
         let value = f(&key);
-        self.insert_inner(key, value, bucket, tag)
+        self.insert_inner(|| cvt(key), || value.clone(), bucket, tag);
+        value
     }
 
     #[inline]
