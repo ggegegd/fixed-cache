@@ -44,6 +44,8 @@ jobs:
         run: cargo build
       - name: test
         run: cargo nextest run --workspace
+      - name: test all features
+        run: cargo nextest run --workspace --all-features
       - name: test --features nightly
         if: matrix.rust == 'nightly'
         run: cargo nextest run --workspace --features nightly

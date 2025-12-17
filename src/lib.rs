@@ -368,6 +368,9 @@ mod tests {
         if cfg!(miri) { n / 10 } else { n }
     }
 
+    type BH = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
+    type Cache<K, V> = super::Cache<K, V, BH>;
+
     fn new_cache<K: Hash + Eq, V: Clone>(size: usize) -> Cache<K, V> {
         Cache::new(size, Default::default())
     }
