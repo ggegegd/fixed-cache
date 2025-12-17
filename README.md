@@ -84,12 +84,6 @@ This design is ideal for memoization caches where:
 - `rapidhash` - Use [rapidhash](https://crates.io/crates/rapidhash) for faster hashing (recommended)
 - `nightly` - Enable nightly-only optimizations
 
-## Testing with Miri
-
-```sh
-cargo +nightly miri test
-```
-
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
