@@ -11,7 +11,9 @@ use core::{
 use equivalent::Equivalent;
 use std::convert::Infallible;
 
-const LOCKED_BIT: usize = 0x0000_8000;
+const NEEDED_BITS: usize = 2;
+const LOCKED_BIT: usize = 1 << 0;
+const ALIVE_BIT: usize = 1 << 1;
 
 #[cfg(feature = "rapidhash")]
 type DefaultBuildHasher = std::hash::BuildHasherDefault<rapidhash::fast::RapidHasher<'static>>;
@@ -30,15 +32,13 @@ type DefaultBuildHasher = std::hash::RandomState;
 ///
 /// # Limitations
 ///
-/// - **No `Drop` support**: Key and value types must not implement `Drop`. Use `Copy` types,
-///   primitives, or `&'static` references.
-/// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is lost.
+/// - **Eviction on collision**: When two keys hash to the same bucket, the older entry is evicted.
 /// - **No iteration or removal**: Individual entries cannot be enumerated or explicitly removed.
 ///
 /// # Type Parameters
 ///
-/// - `K`: The key type. Must implement [`Hash`] + [`Eq`] and must not implement [`Drop`].
-/// - `V`: The value type. Must implement [`Clone`] and must not implement [`Drop`].
+/// - `K`: The key type. Must implement [`Hash`] + [`Eq`].
+/// - `V`: The value type. Must implement [`Clone`].
 /// - `S`: The hash builder type. Must implement [`BuildHasher`]. Defaults to [`RandomState`] or
 ///   [`rapidhash`] if the `rapidhash` feature is enabled.
 ///
@@ -92,9 +92,12 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `num` is not a power of two.
+    /// Panics if `num`:
+    /// - is not a power of two.
+    /// - isn't at least 4.
+    // See len_assertion for why.
     pub fn new(num: usize, build_hasher: S) -> Self {
-        assert!(num.is_power_of_two(), "capacity must be a power of two");
+        Self::len_assertion(num);
         let entries =
             Box::into_raw((0..num).map(|_| Bucket::new()).collect::<Vec<_>>().into_boxed_slice());
         Self::new_inner(entries, build_hasher, true)
@@ -104,20 +107,28 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if `entries.len()` is not a power of two.
+    /// See [`new`](Self::new).
     #[inline]
     pub const fn new_static(entries: &'static [Bucket<(K, V)>], build_hasher: S) -> Self {
+        Self::len_assertion(entries.len());
         Self::new_inner(entries, build_hasher, false)
     }
 
     #[inline]
     const fn new_inner(entries: *const [Bucket<(K, V)>], build_hasher: S, drop: bool) -> Self {
-        const {
-            assert!(!std::mem::needs_drop::<K>(), "dropping keys is not supported yet");
-            assert!(!std::mem::needs_drop::<V>(), "dropping values is not supported yet");
-        }
-        assert!(entries.len().is_power_of_two());
         Self { entries, build_hasher, drop }
+    }
+
+    #[inline]
+    const fn len_assertion(len: usize) {
+        // We need `NEEDED_BITS` bits to store metadata for each entry.
+        // Since we calculate the tag mask based on the index mask, and the index mask is (len - 1),
+        // we assert that the length's bottom `NEEDED_BITS` bits are zero.
+        assert!(len.is_power_of_two(), "length must be a power of two");
+        assert!(
+            (len & ((1 << NEEDED_BITS) - 1)) == 0,
+            "len must have its bottom N bits set to zero"
+        );
     }
 
     #[inline]
@@ -151,6 +162,8 @@ where
     V: Clone,
     S: BuildHasher,
 {
+    const NEEDS_DROP: bool = Bucket::<(K, V)>::NEEDS_DROP;
+
     /// Get an entry from the cache.
     pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<V> {
         let (bucket, tag) = self.calc(key);
@@ -165,7 +178,7 @@ where
         tag: usize,
     ) -> Option<V> {
         if bucket.try_lock(Some(tag)) {
-            // SAFETY: We hold the lock, so we have exclusive access.
+            // SAFETY: We hold the lock and bucket is alive, so we have exclusive access.
             let (ck, v) = unsafe { (*bucket.data.get()).assume_init_ref() };
             if key.equivalent(ck) {
                 let v = v.clone();
@@ -193,10 +206,14 @@ where
         bucket: &Bucket<(K, V)>,
         tag: usize,
     ) {
-        if bucket.try_lock(None) {
+        if let Some(prev_tag) = bucket.try_lock_ret(None) {
             // SAFETY: We hold the lock, so we have exclusive access.
             unsafe {
                 let data = (&mut *bucket.data.get()).as_mut_ptr();
+                // Drop old value if bucket was alive.
+                if Self::NEEDS_DROP && (prev_tag & ALIVE_BIT) != 0 {
+                    core::ptr::drop_in_place(data);
+                }
                 (&raw mut (*data).0).write(make_key());
                 (&raw mut (*data).1).write(make_value());
             }
@@ -291,7 +308,10 @@ where
         let hash = self.hash_key(key);
         // SAFETY: index is masked to be within bounds.
         let bucket = unsafe { (&*self.entries).get_unchecked(hash & self.index_mask()) };
-        let tag = hash & self.tag_mask();
+        let mut tag = hash & self.tag_mask();
+        if Self::NEEDS_DROP {
+            tag |= ALIVE_BIT;
+        }
         (bucket, tag)
     }
 
@@ -310,6 +330,7 @@ where
 impl<K, V, S> Drop for Cache<K, V, S> {
     fn drop(&mut self) {
         if self.drop {
+            // SAFETY: `Drop` has exclusive access.
             drop(unsafe { Box::from_raw(self.entries.cast_mut()) });
         }
     }
@@ -331,6 +352,8 @@ pub struct Bucket<T> {
 }
 
 impl<T> Bucket<T> {
+    const NEEDS_DROP: bool = std::mem::needs_drop::<T>();
+
     /// Creates a new zeroed bucket.
     #[inline]
     pub const fn new() -> Self {
@@ -339,17 +362,27 @@ impl<T> Bucket<T> {
 
     #[inline]
     fn try_lock(&self, expected: Option<usize>) -> bool {
+        self.try_lock_ret(expected).is_some()
+    }
+
+    #[inline]
+    fn try_lock_ret(&self, expected: Option<usize>) -> Option<usize> {
         let state = self.tag.load(Ordering::Relaxed);
         if let Some(expected) = expected {
             if state != expected {
-                return false;
+                return None;
             }
         } else if state & LOCKED_BIT != 0 {
-            return false;
+            return None;
         }
         self.tag
             .compare_exchange(state, state | LOCKED_BIT, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+            .ok()
+    }
+
+    #[inline]
+    fn is_alive(&self) -> bool {
+        self.tag.load(Ordering::Relaxed) & ALIVE_BIT != 0
     }
 
     #[inline]
@@ -361,6 +394,15 @@ impl<T> Bucket<T> {
 // SAFETY: `Bucket` is a specialized `Mutex<T>` that never blocks.
 unsafe impl<T: Send> Send for Bucket<T> {}
 unsafe impl<T: Send> Sync for Bucket<T> {}
+
+impl<T> Drop for Bucket<T> {
+    fn drop(&mut self) {
+        if Self::NEEDS_DROP && self.is_alive() {
+            // SAFETY: `Drop` has exclusive access.
+            unsafe { self.data.get_mut().assume_init_drop() };
+        }
+    }
+}
 
 /// Declares a static cache with the given name, key type, value type, and size.
 ///
@@ -413,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn test_basic_get_or_insert() {
+    fn basic_get_or_insert() {
         let cache = new_cache(1024);
 
         let mut computed = false;
@@ -434,18 +476,18 @@ mod tests {
     }
 
     #[test]
-    fn test_different_keys() {
-        let cache: Cache<&'static str, usize> = static_cache!(&'static str, usize, 1024);
+    fn different_keys() {
+        let cache: Cache<String, usize> = new_cache(1024);
 
-        let v1 = cache.get_or_insert_with("hello", |s| s.len());
-        let v2 = cache.get_or_insert_with("world!", |s| s.len());
+        let v1 = cache.get_or_insert_with("hello".to_string(), |s| s.len());
+        let v2 = cache.get_or_insert_with("world!".to_string(), |s| s.len());
 
         assert_eq!(v1, 5);
         assert_eq!(v2, 6);
     }
 
     #[test]
-    fn test_new_dynamic_allocation() {
+    fn new_dynamic_allocation() {
         let cache: Cache<u32, u32> = new_cache(64);
         assert_eq!(cache.capacity(), 64);
 
@@ -454,27 +496,27 @@ mod tests {
     }
 
     #[test]
-    fn test_get_miss() {
+    fn get_miss() {
         let cache = new_cache::<u64, u64>(64);
         assert_eq!(cache.get(&999), None);
     }
 
     #[test]
-    fn test_insert_and_get() {
-        let cache: Cache<u64, &'static str> = new_cache(64);
+    fn insert_and_get() {
+        let cache: Cache<u64, String> = new_cache(64);
 
-        cache.insert(1, "one");
-        cache.insert(2, "two");
-        cache.insert(3, "three");
+        cache.insert(1, "one".to_string());
+        cache.insert(2, "two".to_string());
+        cache.insert(3, "three".to_string());
 
-        assert_eq!(cache.get(&1), Some("one"));
-        assert_eq!(cache.get(&2), Some("two"));
-        assert_eq!(cache.get(&3), Some("three"));
+        assert_eq!(cache.get(&1), Some("one".to_string()));
+        assert_eq!(cache.get(&2), Some("two".to_string()));
+        assert_eq!(cache.get(&3), Some("three".to_string()));
         assert_eq!(cache.get(&4), None);
     }
 
     #[test]
-    fn test_insert_twice() {
+    fn insert_twice() {
         let cache = new_cache(64);
 
         cache.insert(42, 1);
@@ -486,30 +528,30 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_insert_with_ref() {
-        let cache: Cache<&'static str, usize> = new_cache(64);
+    fn get_or_insert_with_ref() {
+        let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
-        let value = cache.get_or_insert_with_ref(key, |s| s.len(), |s| s);
+        let value = cache.get_or_insert_with_ref(key, |s| s.len(), |s| s.to_string());
         assert_eq!(value, 5);
 
-        let value2 = cache.get_or_insert_with_ref(key, |_| 999, |s| s);
+        let value2 = cache.get_or_insert_with_ref(key, |_| 999, |s| s.to_string());
         assert_eq!(value2, 5);
     }
 
     #[test]
-    fn test_get_or_insert_with_ref_different_keys() {
-        let cache: Cache<&'static str, usize> = new_cache(1024);
+    fn get_or_insert_with_ref_different_keys() {
+        let cache: Cache<String, usize> = new_cache(1024);
 
-        let v1 = cache.get_or_insert_with_ref("foo", |s| s.len(), |s| s);
-        let v2 = cache.get_or_insert_with_ref("barbaz", |s| s.len(), |s| s);
+        let v1 = cache.get_or_insert_with_ref("foo", |s| s.len(), |s| s.to_string());
+        let v2 = cache.get_or_insert_with_ref("barbaz", |s| s.len(), |s| s.to_string());
 
         assert_eq!(v1, 3);
         assert_eq!(v2, 6);
     }
 
     #[test]
-    fn test_capacity() {
+    fn capacity() {
         let cache = new_cache::<u64, u64>(256);
         assert_eq!(cache.capacity(), 256);
 
@@ -518,26 +560,26 @@ mod tests {
     }
 
     #[test]
-    fn test_hasher() {
+    fn hasher() {
         let cache = new_cache::<u64, u64>(64);
         let _ = cache.hasher();
     }
 
     #[test]
-    fn test_debug_impl() {
+    fn debug_impl() {
         let cache = new_cache::<u64, u64>(64);
         let debug_str = format!("{:?}", cache);
         assert!(debug_str.contains("Cache"));
     }
 
     #[test]
-    fn test_bucket_new() {
+    fn bucket_new() {
         let bucket: Bucket<(u64, u64)> = Bucket::new();
         assert_eq!(bucket.tag.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn test_many_entries() {
+    fn many_entries() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(500);
 
@@ -555,20 +597,20 @@ mod tests {
     }
 
     #[test]
-    fn test_string_keys() {
-        let cache: Cache<&'static str, i32> = new_cache(1024);
+    fn string_keys() {
+        let cache: Cache<String, i32> = new_cache(1024);
 
-        cache.insert("alpha", 1);
-        cache.insert("beta", 2);
-        cache.insert("gamma", 3);
+        cache.insert("alpha".to_string(), 1);
+        cache.insert("beta".to_string(), 2);
+        cache.insert("gamma".to_string(), 3);
 
-        assert_eq!(cache.get(&"alpha"), Some(1));
-        assert_eq!(cache.get(&"beta"), Some(2));
-        assert_eq!(cache.get(&"gamma"), Some(3));
+        assert_eq!(cache.get("alpha"), Some(1));
+        assert_eq!(cache.get("beta"), Some(2));
+        assert_eq!(cache.get("gamma"), Some(3));
     }
 
     #[test]
-    fn test_zero_values() {
+    fn zero_values() {
         let cache: Cache<u64, u64> = new_cache(64);
 
         cache.insert(0, 0);
@@ -579,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_value() {
+    fn clone_value() {
         #[derive(Clone, PartialEq, Debug)]
         struct MyValue(u64);
 
@@ -603,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_reads() {
+    fn concurrent_reads() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -619,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_writes() {
+    fn concurrent_writes() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -631,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_read_write() {
+    fn concurrent_read_write() {
         let cache: Cache<u64, u64> = new_cache(256);
         let n = iters(1000);
 
@@ -647,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_get_or_insert() {
+    fn concurrent_get_or_insert() {
         let cache: Cache<u64, u64> = new_cache(1024);
         let n = iters(100);
 
@@ -665,14 +707,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_non_power_of_two_panics() {
+    #[should_panic = "power of two"]
+    fn non_power_of_two() {
         let _ = new_cache::<u64, u64>(100);
     }
 
     #[test]
-    fn test_power_of_two_sizes() {
-        for shift in 1..10 {
+    #[should_panic = "len must have its bottom N bits set to zero"]
+    fn small_cache() {
+        let _ = new_cache::<u64, u64>(2);
+    }
+
+    #[test]
+    fn power_of_two_sizes() {
+        for shift in 2..10 {
             let size = 1 << shift;
             let cache = new_cache::<u64, u64>(size);
             assert_eq!(cache.capacity(), size);
@@ -680,29 +728,16 @@ mod tests {
     }
 
     #[test]
-    fn test_small_cache() {
-        let cache = new_cache(2);
-        assert_eq!(cache.capacity(), 2);
+    fn equivalent_key_lookup() {
+        let cache: Cache<String, i32> = new_cache(64);
 
-        cache.insert(1, 10);
-        cache.insert(2, 20);
-        cache.insert(3, 30);
+        cache.insert("hello".to_string(), 42);
 
-        let count = [1, 2, 3].iter().filter(|&&k| cache.get(&k).is_some()).count();
-        assert!(count <= 2);
+        assert_eq!(cache.get("hello"), Some(42));
     }
 
     #[test]
-    fn test_equivalent_key_lookup() {
-        let cache = new_cache(64);
-
-        cache.insert("hello", 42);
-
-        assert_eq!(cache.get(&"hello"), Some(42));
-    }
-
-    #[test]
-    fn test_large_values() {
+    fn large_values() {
         let cache: Cache<u64, [u8; 1000]> = new_cache(64);
 
         let large_value = [42u8; 1000];
@@ -712,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn test_send_sync() {
+    fn send_sync() {
         fn assert_send<T: Send>() {}
         fn assert_sync<T: Sync>() {}
 
@@ -723,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_try_insert_with_ok() {
+    fn get_or_try_insert_with_ok() {
         let cache = new_cache(1024);
 
         let mut computed = false;
@@ -744,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_try_insert_with_err() {
+    fn get_or_try_insert_with_err() {
         let cache: Cache<u64, u64> = new_cache(1024);
 
         let result: Result<u64, &str> = cache.get_or_try_insert_with(42, |_| Err("failed"));
@@ -754,28 +789,100 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_try_insert_with_ref_ok() {
-        let cache: Cache<&'static str, usize> = new_cache(64);
+    fn get_or_try_insert_with_ref_ok() {
+        let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
         let result: Result<usize, &str> =
-            cache.get_or_try_insert_with_ref(key, |s| Ok(s.len()), |s| s);
+            cache.get_or_try_insert_with_ref(key, |s| Ok(s.len()), |s| s.to_string());
         assert_eq!(result, Ok(5));
 
         let result2: Result<usize, &str> =
-            cache.get_or_try_insert_with_ref(key, |_| Ok(999), |s| s);
+            cache.get_or_try_insert_with_ref(key, |_| Ok(999), |s| s.to_string());
         assert_eq!(result2, Ok(5));
     }
 
     #[test]
-    fn test_get_or_try_insert_with_ref_err() {
-        let cache: Cache<&'static str, usize> = new_cache(64);
+    fn get_or_try_insert_with_ref_err() {
+        let cache: Cache<String, usize> = new_cache(64);
 
         let key = "hello";
         let result: Result<usize, &str> =
-            cache.get_or_try_insert_with_ref(key, |_| Err("failed"), |s| s);
+            cache.get_or_try_insert_with_ref(key, |_| Err("failed"), |s| s.to_string());
         assert_eq!(result, Err("failed"));
 
-        assert_eq!(cache.get(&key), None);
+        assert_eq!(cache.get(key), None);
+    }
+
+    #[test]
+    fn drop_on_cache_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Hash, Eq, PartialEq)]
+        struct DropKey(u64);
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone)]
+        struct DropValue(#[allow(dead_code)] u64);
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let cache: super::Cache<DropKey, DropValue, BH> =
+                super::Cache::new(64, Default::default());
+            cache.insert(DropKey(1), DropValue(100));
+            cache.insert(DropKey(2), DropValue(200));
+            cache.insert(DropKey(3), DropValue(300));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+        }
+        // 3 keys + 3 values = 6 drops
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn drop_on_eviction() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        #[derive(Clone, Hash, Eq, PartialEq)]
+        struct DropKey(u64);
+        impl Drop for DropKey {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[derive(Clone)]
+        struct DropValue(#[allow(dead_code)] u64);
+        impl Drop for DropValue {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        {
+            let cache: super::Cache<DropKey, DropValue, BH> =
+                super::Cache::new(64, Default::default());
+            cache.insert(DropKey(1), DropValue(100));
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 0);
+            // Insert same key again - should evict old entry
+            cache.insert(DropKey(1), DropValue(200));
+            // Old key + old value dropped = 2
+            assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
+        }
+        // Cache dropped: new key + new value = 2 more
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 4);
     }
 }
